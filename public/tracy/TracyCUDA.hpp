@@ -686,12 +686,8 @@ namespace tracy
             // Check if any graph execs are pending retirement before entering
             // the record loop — avoids the graphIdsSeenInBuffer heap allocation
             // on the hot path when no execs have been destroyed.
-            bool trackRetirement;
-            {
-                auto& state = PersistentState::Get();
-                std::lock_guard<std::mutex> lock(state.graphRetireMutex);
-                trackRetirement = !state.graphExecPendingRetire.empty();
-            }
+            // Uses an atomic flag so we skip the mutex entirely in the common case.
+            bool trackRetirement = PersistentState::Get().graphRetirePending.load(std::memory_order_acquire);
             CUptiResult status;
             CUpti_Activity* record = nullptr;
             std::unordered_set<GraphID> graphIdsSeenInBuffer;
@@ -728,6 +724,9 @@ namespace tracy
                     } else {
                         ++it;
                     }
+                }
+                if (state.graphExecPendingRetire.empty()) {
+                    state.graphRetirePending.store(false, std::memory_order_release);
                 }
             }
 
@@ -944,6 +943,7 @@ namespace tracy
                         auto& state = PersistentState::Get();
                         std::lock_guard<std::mutex> lock(state.graphRetireMutex);
                         state.graphExecPendingRetire.insert(retireGraphId);
+                        state.graphRetirePending.store(true, std::memory_order_release);
                     }
                 }
             }
@@ -1376,11 +1376,16 @@ namespace tracy
             // NOTE(marcos): these objects do not need to persist, but their relative
             // footprint is trivial enough that we don't care if we let them leak
             ConcurrentHashMap<CorrelationID, APICallInfo> cudaCallSiteInfo;
+            // Graph launch cache: entries are retired via graphExecPendingRetire
+            // when the corresponding cudaGraphExec is destroyed.
             ConcurrentHashMap<GraphID, APICallInfo> cudaGraphCurrentLaunch;
             ConcurrentHashMap<uintptr_t, int> memAllocAddress;
             // Pending retirement: graphIds whose exec handles have been destroyed.
             // Entries are erased from cudaGraphCurrentLaunch in OnBufferCompleted
             // once no further activity records for the exec arrive in a buffer.
+            // graphRetirePending is an atomic dirty-flag so OnBufferCompleted can
+            // skip the mutex on the hot path when no execs have been destroyed.
+            std::atomic<bool> graphRetirePending{false};
             std::mutex graphRetireMutex;
             std::unordered_set<GraphID> graphExecPendingRetire;
             CUpti_SubscriberHandle subscriber = {};
