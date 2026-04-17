@@ -52,7 +52,7 @@ void View::SetFindZonePlaybackFrame( int idx )
     playback.currentFrame = idx;
     // Find-zone replay always grows the visible limit range from the replay start to the current
     // frame so histogram and group statistics evolve cumulatively in-place.
-    playback.currentRange = { m_worker.GetFrameBegin( *playback.frameSet, playback.targetFrameRange.first ), m_worker.GetFrameEnd( *playback.frameSet, idx ), true };
+    playback.currentRange = RangeSlim{ m_worker.GetFrameBegin( *playback.frameSet, playback.targetFrameRange.first ), m_worker.GetFrameEnd( *playback.frameSet, idx ), true };
     if( idx >= playback.targetFrameRange.second - 1 )
     {
         playback.pause = true;
