@@ -51,6 +51,10 @@ constexpr const char* GpuContextNames[] = {
     "Rocprof"
 };
 
+static constexpr std::array<float, 6> StatisticsReplaySpeeds = { 1.f, 5.f, 10.f, 20.f, 50.f, 100.f };
+static constexpr std::array<const char*, 6> StatisticsReplaySpeedLabels = { "1x", "5x", "10x", "20x", "50x", "100x" };
+static constexpr uint8_t StatisticsReplayDefaultSpeed = 4;
+
 struct MemoryPage;
 class FileRead;
 class SourceView;
@@ -393,6 +397,10 @@ private:
     void DrawCallstackCalls( const CallstackFrameId* data, size_t size, uint16_t limit ) const;
     nlohmann::json GetCallstackJson( const CallstackFrameId* data, size_t size ) const;
     void SetViewToLastFrames();
+    void ResetFindZonePlayback();
+    void ResetFindZonePlaybackData();
+    void SetFindZonePlaybackFrame( int idx );
+    void StartFindZonePlayback( std::pair<int, int> range );
     int64_t GetZoneChildTime( const ZoneEvent& zone );
     int64_t GetZoneChildTime( const GpuEvent& zone );
     int64_t GetZoneChildTimeFast( const ZoneEvent& zone );
@@ -409,6 +417,11 @@ private:
     void CalcZoneTimeDataImpl( const V& children, unordered_flat_map<int16_t, ZoneTimeData>& data, int64_t& ztime );
     template<typename Adapter, typename V>
     void CalcZoneTimeDataImpl( const V& children, const ContextSwitch* ctx, unordered_flat_map<int16_t, ZoneTimeData>& data, int64_t& ztime );
+
+    void ResetFrameSortData();
+    void ResetFrameSortPlayback();
+    void SetFrameSortPlaybackFrame( int idx );
+    void StartFrameSortPlayback( std::pair<int, int> range );
 
     void SetPlaybackFrame( uint32_t idx );
     bool Save( const char* fn, FileCompression comp, int zlevel, bool buildDict, int streams );
@@ -733,6 +746,23 @@ private:
         bool showZoneInFrames = false;
         Range range;
         RangeSlim rangeSlim;
+        struct
+        {
+            const FrameData* frameSet = nullptr;
+            // Final replay span selected by the UI; the live replay range only exposes a prefix of it.
+            std::pair<int, int> targetFrameRange = { 0, 0 };
+            // Full replay-range data used to keep histogram axes fixed while replay advances.
+            std::vector<int64_t> fullSorted;
+            // Effective time range shown by the current replay frame.
+            RangeSlim currentRange;
+            // Last replay range that accumulated find-zone statistics were built against.
+            RangeSlim rangeSlim;
+            int currentFrame = 0;
+            float timeLeft = 0;
+            uint8_t speed = StatisticsReplayDefaultSpeed;
+            bool active = false;
+            bool pause = true;
+        } playback;
 
         struct
         {
@@ -749,6 +779,9 @@ private:
 
         void Reset()
         {
+            const auto playbackSpeed = playback.speed;
+            playback = {};
+            playback.speed = playbackSpeed;
             ResetMatch();
             match.clear();
             selMatch = 0;
@@ -760,6 +793,9 @@ private:
 
         void ResetMatch()
         {
+            const auto playbackSpeed = playback.speed;
+            playback = {};
+            playback.speed = playbackSpeed;
             ResetGroups();
             sorted.clear();
             sortedNum = 0;
@@ -909,6 +945,20 @@ private:
         bool limitToView = false;
         std::pair<int, int> limitRange = { -1, 0 };
         int minBinVal = 1;
+        struct
+        {
+            const FrameData* frameSet = nullptr;
+            // Final replay span selected by the UI; the live replay range only exposes a prefix of it.
+            std::pair<int, int> targetRange = { 0, 0 };
+            // Full replay-range frame times used to keep histogram axes fixed while replay advances.
+            std::vector<int64_t> fullData;
+            int currentFrame = 0;
+            float timeLeft = 0;
+            uint8_t speed = StatisticsReplayDefaultSpeed;
+            bool active = false;
+            bool pause = true;
+            bool limitToView = false;
+        } playback;
     } m_frameSortData;
 
     struct {

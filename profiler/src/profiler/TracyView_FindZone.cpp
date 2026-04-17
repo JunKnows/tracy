@@ -17,6 +17,123 @@ namespace tracy
 
 extern double s_time;
 
+void View::ResetFindZonePlayback()
+{
+    const auto speed = m_findZone.playback.speed;
+    m_findZone.playback = {};
+    m_findZone.playback.speed = speed;
+}
+
+void View::ResetFindZonePlaybackData()
+{
+    // Clear only accumulated replay/statistics data. Search terms, selected match, and UI toggles
+    // are preserved so the window can resume from the same user context.
+    m_findZone.sorted.clear();
+    m_findZone.sortedNum = 0;
+    m_findZone.average = 0;
+    m_findZone.median = 0;
+    m_findZone.p75 = 0;
+    m_findZone.p90 = 0;
+    m_findZone.p99 = 0;
+    m_findZone.p99_9 = 0;
+    m_findZone.total = 0;
+    m_findZone.tmin = std::numeric_limits<int64_t>::max();
+    m_findZone.tmax = std::numeric_limits<int64_t>::min();
+    m_findZone.ResetSelection();
+    m_findZone.groups.clear();
+    m_findZone.processed = 0;
+    m_findZone.groupId = 0;
+    m_findZone.selCs = 0;
+}
+
+void View::SetFindZonePlaybackFrame( int idx )
+{
+    auto& playback = m_findZone.playback;
+    playback.currentFrame = idx;
+    // Find-zone replay always grows the visible limit range from the replay start to the current
+    // frame so histogram and group statistics evolve cumulatively in-place.
+    playback.currentRange = { m_worker.GetFrameBegin( *playback.frameSet, playback.targetFrameRange.first ), m_worker.GetFrameEnd( *playback.frameSet, idx ), true };
+    if( idx >= playback.targetFrameRange.second - 1 )
+    {
+        playback.pause = true;
+        playback.timeLeft = 0;
+    }
+    else
+    {
+        // Replay cadence follows the real frame duration.
+        const auto frameTime = std::max<int64_t>( m_worker.GetFrameTime( *playback.frameSet, idx ), 1 );
+        playback.timeLeft = frameTime / 1000000000.f;
+    }
+}
+
+void View::StartFindZonePlayback( std::pair<int, int> range )
+{
+    if( range.first >= range.second )
+    {
+        ResetFindZonePlayback();
+        return;
+    }
+
+    ResetFindZonePlaybackData();
+
+    auto& playback = m_findZone.playback;
+    playback.frameSet = m_frames;
+    playback.targetFrameRange = range;
+    // Capture the full target range up front so the histogram can keep stable axes during replay.
+    playback.fullSorted.clear();
+    auto initialFrame = range.second - 1;
+    bool haveInitialFrame = false;
+    if( !m_findZone.match.empty() )
+    {
+        auto& zoneData = m_worker.GetZonesForSourceLocation( m_findZone.match[m_findZone.selMatch] );
+        auto& zones = zoneData.zones;
+        zones.ensure_sorted();
+
+        const auto rangeMin = m_worker.GetFrameBegin( *m_frames, range.first );
+        const auto rangeMax = m_worker.GetFrameEnd( *m_frames, range.second - 1 );
+        playback.fullSorted.reserve( zones.size() );
+
+        for( auto& ev : zones )
+        {
+            auto& zone = *ev.Zone();
+            const auto start = zone.Start();
+            const auto end = zone.End();
+            if( end > rangeMax || start < rangeMin ) continue;
+
+            int64_t t = 0;
+            if( m_findZone.runningTime )
+            {
+                const auto ctx = m_worker.GetContextSwitchData( m_worker.DecompressThread( ev.Thread() ) );
+                if( !ctx ) break;
+                uint64_t cnt;
+                if( !GetZoneRunningTime( ctx, zone, t, cnt ) ) break;
+            }
+            else if( m_findZone.selfTime )
+            {
+                t = end - start - GetZoneChildTimeFast( zone );
+            }
+            else
+            {
+                t = end - start;
+            }
+            playback.fullSorted.emplace_back( t );
+            // Start from the first frame that actually contributes data to avoid flashing an empty histogram.
+            const auto zoneEndTime = std::max( start, end - 1 );
+            const auto zoneFrame = std::min( m_worker.GetFrameRange( *m_frames, zoneEndTime, zoneEndTime ).first, range.second - 1 );
+            initialFrame = haveInitialFrame ? std::min( initialFrame, zoneFrame ) : zoneFrame;
+            haveInitialFrame = true;
+        }
+
+        pdqsort_branchless( playback.fullSorted.begin(), playback.fullSorted.end() );
+    }
+    playback.active = true;
+    playback.pause = false;
+    if( !haveInitialFrame ) initialFrame = range.first;
+    // Keep the first rendered replay state non-empty whenever the matched zones allow it.
+    SetFindZonePlaybackFrame( initialFrame );
+    playback.rangeSlim = playback.currentRange;
+}
+
 #ifndef TRACY_NO_STATISTICS
 void View::FindZones()
 {
@@ -78,7 +195,7 @@ void View::DrawZoneList( int id, const Vector<short_ptr<ZoneEvent>>& zones )
 {
     const auto zsz = zones.size();
     char buf[32];
-    sprintf( buf, "%i##zonelist", id );
+    snprintf( buf, sizeof( buf ), "%i##zonelist", id );
     if( !ImGui::BeginTable( buf, 3, ImGuiTableFlags_NoSavedSettings | ImGuiTableFlags_Resizable | ImGuiTableFlags_Hideable | ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_Sortable | ImGuiTableFlags_ScrollY, ImVec2( 0, ImGui::GetTextLineHeightWithSpacing() * std::min<size_t>( zsz + 1, 15 ) ) ) )
     {
         ImGui::TreePop();
@@ -260,6 +377,7 @@ void View::DrawFindZone()
     const auto scale = GetScale();
     ImGui::SetNextWindowSize( ImVec2( 520 * scale, 800 * scale ), ImGuiCond_FirstUseEver );
     ImGui::Begin( "Find zone", &m_findZone.show, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse );
+    if( !m_findZone.show ) m_findZone.playback.pause = true;
     if( ImGui::GetCurrentWindowRead()->SkipItems ) { ImGui::End(); return; }
 #ifdef TRACY_NO_STATISTICS
     ImGui::TextWrapped( "Collection of statistical data is disabled in this build." );
@@ -332,6 +450,101 @@ void View::DrawFindZone()
         ToggleButton( ICON_FA_RULER " Limits", m_showRanges );
     }
 
+    const auto framesUsed = m_worker.AreFramesUsed() && m_frames;
+    const auto fullFrameCount = framesUsed ? int( m_worker.GetFullFrameCount( *m_frames ) ) : 0;
+    const auto replayFrameRange = framesUsed ? ( m_findZone.range.active ? m_worker.GetFrameRange( *m_frames, m_findZone.range.min, m_findZone.range.max ) : std::make_pair( 0, fullFrameCount ) ) : std::make_pair( 0, 0 );
+    const auto replayDisabled = replayFrameRange.first >= replayFrameRange.second;
+    const auto replayActive = m_findZone.playback.active;
+    const auto replayAction = GetReplayButtonAction( replayActive, m_findZone.playback.pause, m_findZone.playback.currentFrame, m_findZone.playback.targetFrameRange.second );
+    const auto replayRunning = replayAction == ReplayButtonAction::Pause;
+    const auto replayCanExit = replayActive && m_findZone.playback.pause;
+    const auto replayLabel = GetReplayButtonLabel( replayAction );
+
+    ImGui::SameLine();
+    if( ButtonDisablable( replayLabel, replayDisabled ) )
+    {
+        if( replayRunning )
+        {
+            m_findZone.playback.pause = true;
+        }
+        else if( replayAction == ReplayButtonAction::Continue )
+        {
+            m_findZone.playback.pause = false;
+        }
+        else
+        {
+            StartFindZonePlayback( replayFrameRange );
+        }
+    }
+
+    ImGui::SameLine();
+    ImGui::TextDisabled( "Speed:" );
+    ImGui::SameLine();
+    if( replayDisabled ) ImGui::BeginDisabled();
+    ImGui::SetNextItemWidth( GetReplaySpeedComboWidth( scale ) );
+    StringArrayCombo( "##findZoneReplaySpeed", StatisticsReplaySpeedLabels, m_findZone.playback.speed );
+    if( replayDisabled ) ImGui::EndDisabled();
+
+    ImGui::SameLine();
+    if( ButtonDisablable( ICON_FA_XMARK " Exit", !replayCanExit ) )
+    {
+        ResetFindZonePlayback();
+        ResetFindZonePlaybackData();
+    }
+
+    if( m_findZone.playback.active )
+    {
+        if( m_findZone.playback.frameSet != m_frames || m_findZone.playback.targetFrameRange != replayFrameRange )
+        {
+            // Changing frame set or limit range invalidates the replay target and all accumulated data.
+            ResetFindZonePlayback();
+            ResetFindZonePlaybackData();
+        }
+        else
+        {
+            if( !m_findZone.playback.pause )
+            {
+                auto time = ImGui::GetIO().DeltaTime * StatisticsReplaySpeeds[m_findZone.playback.speed];
+                while( !m_findZone.playback.pause && time > 0 )
+                {
+                    const auto dt = std::min( time, m_findZone.playback.timeLeft );
+                    time -= dt;
+                    m_findZone.playback.timeLeft -= dt;
+                    if( m_findZone.playback.timeLeft <= 0 )
+                    {
+                        if( m_findZone.playback.currentFrame + 1 < m_findZone.playback.targetFrameRange.second )
+                        {
+                            SetFindZonePlaybackFrame( m_findZone.playback.currentFrame + 1 );
+                        }
+                        else
+                        {
+                            m_findZone.playback.pause = true;
+                        }
+                    }
+                }
+                m_wasActive = true;
+            }
+
+            if( m_findZone.playback.rangeSlim.active != m_findZone.playback.currentRange.active ||
+                m_findZone.playback.rangeSlim.min != m_findZone.playback.currentRange.min ||
+                m_findZone.playback.rangeSlim.max != m_findZone.playback.currentRange.max )
+            {
+                // Find-zone statistics and grouping caches are range-dependent, so advancing replay
+                // to a new effective range must rebuild them from scratch.
+                ResetFindZonePlaybackData();
+                m_findZone.playback.rangeSlim = m_findZone.playback.currentRange;
+            }
+        }
+
+        if( m_findZone.playback.active )
+        {
+            const auto currentReplayFrame = m_findZone.playback.currentFrame - m_findZone.playback.targetFrameRange.first + 1;
+            const auto totalReplayFrames = m_findZone.playback.targetFrameRange.second - m_findZone.playback.targetFrameRange.first;
+            ImGui::SameLine();
+            ImGui::TextDisabled( "(%s/%s)", RealToString( currentReplayFrame ), RealToString( totalReplayFrames ) );
+        }
+    }
+
     if( m_findZone.rangeSlim != m_findZone.range )
     {
         m_findZone.ResetMatch();
@@ -366,8 +579,10 @@ void View::DrawFindZone()
     {
         Achieve( "findZone" );
 
-        const auto rangeMin = m_findZone.range.min;
-        const auto rangeMax = m_findZone.range.max;
+        const auto effectiveRange = m_findZone.playback.active ? m_findZone.playback.currentRange : RangeSlim{ m_findZone.range.min, m_findZone.range.max, m_findZone.range.active };
+        const auto rangeMin = effectiveRange.min;
+        const auto rangeMax = effectiveRange.max;
+        const auto rangeActive = effectiveRange.active;
 
         bool expand = ImGui::TreeNodeEx( "Matched source locations", ImGuiTreeNodeFlags_DefaultOpen );
         ImGui::SameLine();
@@ -449,7 +664,7 @@ void View::DrawFindZone()
                 size_t i;
                 if( m_findZone.runningTime )
                 {
-                    if( m_findZone.range.active )
+                    if( rangeActive )
                     {
                         for( i=m_findZone.sortedNum; i<zsz; i++ )
                         {
@@ -488,7 +703,7 @@ void View::DrawFindZone()
                 {
                     tmin = zoneData.selfMin;
                     tmax = zoneData.selfMax;
-                    if( m_findZone.range.active )
+                    if( rangeActive )
                     {
                         for( i=m_findZone.sortedNum; i<zsz; i++ )
                         {
@@ -517,7 +732,7 @@ void View::DrawFindZone()
                 {
                     tmin = zoneData.min;
                     tmax = zoneData.max;
-                    if( m_findZone.range.active )
+                    if( rangeActive )
                     {
                         for( i=m_findZone.sortedNum; i<zsz; i++ )
                         {
@@ -579,7 +794,7 @@ void View::DrawFindZone()
                     int64_t total = m_findZone.selTotal;
                     if( m_findZone.runningTime )
                     {
-                        if( m_findZone.range.active )
+                        if( rangeActive )
                         {
                             for( size_t i=m_findZone.selSortNum; i<m_findZone.sortedNum; i++ )
                             {
@@ -619,7 +834,7 @@ void View::DrawFindZone()
                     }
                     else if( m_findZone.selfTime )
                     {
-                        if( m_findZone.range.active )
+                        if( rangeActive )
                         {
                             for( size_t i=m_findZone.selSortNum; i<m_findZone.sortedNum; i++ )
                             {
@@ -653,7 +868,7 @@ void View::DrawFindZone()
                     }
                     else
                     {
-                        if( m_findZone.range.active )
+                        if( rangeActive )
                         {
                             for( size_t i=m_findZone.selSortNum; i<m_findZone.sortedNum; i++ )
                             {
@@ -882,67 +1097,6 @@ void View::DrawFindZone()
                         const auto s = std::min( m_findZone.highlight.start, m_findZone.highlight.end );
                         const auto e = std::max( m_findZone.highlight.start, m_findZone.highlight.end );
 
-                        const auto& sorted = m_findZone.sorted;
-
-                        auto sortedBegin = sorted.begin();
-                        auto sortedEnd = sorted.end();
-                        while( sortedBegin != sortedEnd && *sortedBegin == 0 ) ++sortedBegin;
-
-                        if( m_findZone.minBinVal > 1 || m_findZone.range.active )
-                        {
-                            if( m_findZone.logTime )
-                            {
-                                const auto tMinLog = log10( tmin );
-                                const auto zmax = ( log10( tmax ) - tMinLog ) / numBins;
-                                int64_t i;
-                                for( i=0; i<numBins; i++ )
-                                {
-                                    const auto nextBinVal = int64_t( pow( 10.0, tMinLog + ( i+1 ) * zmax ) );
-                                    auto nit = std::lower_bound( sortedBegin, sortedEnd, nextBinVal );
-                                    const auto distance = std::distance( sortedBegin, nit );
-                                    if( distance >= m_findZone.minBinVal ) break;
-                                    sortedBegin = nit;
-                                }
-                                for( int64_t j=numBins-1; j>i; j-- )
-                                {
-                                    const auto nextBinVal = int64_t( pow( 10.0, tMinLog + ( j-1 ) * zmax ) );
-                                    auto nit = std::lower_bound( sortedBegin, sortedEnd, nextBinVal );
-                                    const auto distance = std::distance( nit, sortedEnd );
-                                    if( distance >= m_findZone.minBinVal ) break;
-                                    sortedEnd = nit;
-                                }
-                            }
-                            else
-                            {
-                                const auto zmax = tmax - tmin;
-                                int64_t i;
-                                for( i=0; i<numBins; i++ )
-                                {
-                                    const auto nextBinVal = tmin + ( i+1 ) * zmax / numBins;
-                                    auto nit = std::lower_bound( sortedBegin, sortedEnd, nextBinVal );
-                                    const auto distance = std::distance( sortedBegin, nit );
-                                    if( distance >= m_findZone.minBinVal ) break;
-                                    sortedBegin = nit;
-                                }
-                                for( int64_t j=numBins-1; j>i; j-- )
-                                {
-                                    const auto nextBinVal = tmin + ( j-1 ) * zmax / numBins;
-                                    auto nit = std::lower_bound( sortedBegin, sortedEnd, nextBinVal );
-                                    const auto distance = std::distance( nit, sortedEnd );
-                                    if( distance >= m_findZone.minBinVal ) break;
-                                    sortedEnd = nit;
-                                }
-                            }
-
-                            if( sortedBegin != sorted.end() )
-                            {
-                                tmin = *sortedBegin;
-                                tmax = *(sortedEnd-1);
-                                total = 0;
-                                for( auto ptr = sortedBegin; ptr != sortedEnd; ptr++ ) total += *ptr;
-                            }
-                        }
-
                         if( numBins > m_findZone.numBins )
                         {
                             m_findZone.numBins = numBins;
@@ -956,115 +1110,316 @@ void View::DrawFindZone()
                         const auto& binTime = m_findZone.binTime;
                         const auto& selBin = m_findZone.selBin;
 
-                        const auto distBegin = std::distance( sorted.begin(), sortedBegin );
-                        const auto distEnd = std::distance( sorted.begin(), sortedEnd );
-                        if( m_findZone.binCache.numBins != numBins ||
-                            m_findZone.binCache.distBegin != distBegin ||
-                            m_findZone.binCache.distEnd != distEnd )
+                        int64_t fixedAxisMaxVal = 0;
+                        bool fixedReplayAxes = m_findZone.playback.active && !m_findZone.playback.fullSorted.empty();
+                        if( fixedReplayAxes )
                         {
-                            m_findZone.binCache.numBins = numBins;
-                            m_findZone.binCache.distBegin = distBegin;
-                            m_findZone.binCache.distEnd = distEnd;
-
+                            // Replay fills the current bins progressively, but the axis extents stay locked to
+                            // the full replay range so the histogram doesn't rescale every frame.
                             memset( bins.get(), 0, sizeof( int64_t ) * numBins );
                             memset( binTime.get(), 0, sizeof( int64_t ) * numBins );
                             memset( selBin.get(), 0, sizeof( int64_t ) * numBins );
 
                             int64_t selectionTime = 0;
+                            auto axisBegin = m_findZone.playback.fullSorted.begin();
+                            auto axisEnd = m_findZone.playback.fullSorted.end();
+                            while( axisBegin != axisEnd && *axisBegin == 0 ) ++axisBegin;
 
-                            if( m_findZone.logTime )
+                            if( axisBegin == axisEnd )
                             {
-                                const auto tMinLog = log10( tmin );
-                                const auto zmax = ( log10( tmax ) - tMinLog ) / numBins;
+                                fixedReplayAxes = false;
+                            }
+                            else
+                            {
+                                tmin = *axisBegin;
+                                tmax = *( axisEnd - 1 );
+                                if( m_findZone.minBinVal > 1 )
                                 {
+                                    if( m_findZone.logTime )
+                                    {
+                                        const auto tMinLog = log10( tmin );
+                                        const auto zmax = ( log10( tmax ) - tMinLog ) / numBins;
+                                        int64_t i;
+                                        for( i = 0; i < numBins; i++ )
+                                        {
+                                            const auto nextBinVal = int64_t( pow( 10.0, tMinLog + ( i + 1 ) * zmax ) );
+                                            auto nit = std::lower_bound( axisBegin, axisEnd, nextBinVal );
+                                            const auto distance = std::distance( axisBegin, nit );
+                                            if( distance >= m_findZone.minBinVal ) break;
+                                            axisBegin = nit;
+                                        }
+                                        for( int64_t j = numBins - 1; j > i; j-- )
+                                        {
+                                            const auto nextBinVal = int64_t( pow( 10.0, tMinLog + ( j - 1 ) * zmax ) );
+                                            auto nit = std::lower_bound( axisBegin, axisEnd, nextBinVal );
+                                            const auto distance = std::distance( nit, axisEnd );
+                                            if( distance >= m_findZone.minBinVal ) break;
+                                            axisEnd = nit;
+                                        }
+                                    }
+                                    else
+                                    {
+                                        const auto zmax = tmax - tmin;
+                                        int64_t i;
+                                        for( i = 0; i < numBins; i++ )
+                                        {
+                                            const auto nextBinVal = tmin + ( i + 1 ) * zmax / numBins;
+                                            auto nit = std::lower_bound( axisBegin, axisEnd, nextBinVal );
+                                            const auto distance = std::distance( axisBegin, nit );
+                                            if( distance >= m_findZone.minBinVal ) break;
+                                            axisBegin = nit;
+                                        }
+                                        for( int64_t j = numBins - 1; j > i; j-- )
+                                        {
+                                            const auto nextBinVal = tmin + ( j - 1 ) * zmax / numBins;
+                                            auto nit = std::lower_bound( axisBegin, axisEnd, nextBinVal );
+                                            const auto distance = std::distance( nit, axisEnd );
+                                            if( distance >= m_findZone.minBinVal ) break;
+                                            axisEnd = nit;
+                                        }
+                                    }
+                                }
+
+                                if( axisBegin == axisEnd )
+                                {
+                                    fixedReplayAxes = false;
+                                }
+                                else
+                                {
+                                    tmin = *axisBegin;
+                                    tmax = *( axisEnd - 1 );
+                                    if( tmax <= tmin )
+                                    {
+                                        fixedReplayAxes = false;
+                                    }
+                                    else
+                                    {
+                                        std::vector<int64_t> axisBins( numBins, 0 );
+                                        std::vector<int64_t> axisBinTime( numBins, 0 );
+                                        const auto valueToBin = [numBins, tmin, tmax, this]( int64_t value ) {
+                                            if( m_findZone.logTime )
+                                            {
+                                                const auto ltmin = log10( tmin );
+                                                const auto ltmax = log10( tmax );
+                                                return std::clamp( int( ( log10( value ) - ltmin ) / ( ltmax - ltmin ) * numBins ), 0, int( numBins ) - 1 );
+                                            }
+                                            return std::clamp( int( ( value - tmin ) / double( tmax - tmin ) * numBins ), 0, int( numBins ) - 1 );
+                                        };
+
+                                        for( auto it = axisBegin; it != axisEnd; ++it )
+                                        {
+                                            const auto bin = valueToBin( *it );
+                                            axisBins[bin]++;
+                                            axisBinTime[bin] += *it;
+                                        }
+
+                                        for( auto value : m_findZone.sorted )
+                                        {
+                                            if( value <= 0 || value < tmin || value > tmax ) continue;
+                                            const auto bin = valueToBin( value );
+                                            bins[bin]++;
+                                            binTime[bin] += value;
+                                            if( m_findZone.highlight.active && value >= s && value <= e ) selectionTime += value;
+                                        }
+
+                                        if( m_findZone.selGroup != m_findZone.Unselected )
+                                        {
+                                            for( auto value : m_findZone.selSort )
+                                            {
+                                                if( value <= 0 || value < tmin || value > tmax ) continue;
+                                                const auto bin = valueToBin( value );
+                                                if( cumulateTime ) selBin[bin] += value;
+                                                else selBin[bin]++;
+                                            }
+                                        }
+
+                                        fixedAxisMaxVal = cumulateTime
+                                                              ? *std::max_element( axisBinTime.begin(), axisBinTime.end() )
+                                                              : *std::max_element( axisBins.begin(), axisBins.end() );
+                                        m_findZone.selTime = selectionTime;
+                                    }
+                                }
+                            }
+                        }
+                        if( !fixedReplayAxes )
+                        {
+                            const auto& sorted = m_findZone.sorted;
+
+                            auto sortedBegin = sorted.begin();
+                            auto sortedEnd = sorted.end();
+                            while( sortedBegin != sortedEnd && *sortedBegin == 0 ) ++sortedBegin;
+
+                            if( m_findZone.minBinVal > 1 || rangeActive )
+                            {
+                                if( m_findZone.logTime )
+                                {
+                                    const auto tMinLog = log10( tmin );
+                                    const auto zmax = ( log10( tmax ) - tMinLog ) / numBins;
+                                    int64_t i;
+                                    for( i = 0; i < numBins; i++ )
+                                    {
+                                        const auto nextBinVal = int64_t( pow( 10.0, tMinLog + ( i + 1 ) * zmax ) );
+                                        auto nit = std::lower_bound( sortedBegin, sortedEnd, nextBinVal );
+                                        const auto distance = std::distance( sortedBegin, nit );
+                                        if( distance >= m_findZone.minBinVal ) break;
+                                        sortedBegin = nit;
+                                    }
+                                    for( int64_t j = numBins - 1; j > i; j-- )
+                                    {
+                                        const auto nextBinVal = int64_t( pow( 10.0, tMinLog + ( j - 1 ) * zmax ) );
+                                        auto nit = std::lower_bound( sortedBegin, sortedEnd, nextBinVal );
+                                        const auto distance = std::distance( nit, sortedEnd );
+                                        if( distance >= m_findZone.minBinVal ) break;
+                                        sortedEnd = nit;
+                                    }
+                                }
+                                else
+                                {
+                                    const auto zmax = tmax - tmin;
+                                    int64_t i;
+                                    for( i = 0; i < numBins; i++ )
+                                    {
+                                        const auto nextBinVal = tmin + ( i + 1 ) * zmax / numBins;
+                                        auto nit = std::lower_bound( sortedBegin, sortedEnd, nextBinVal );
+                                        const auto distance = std::distance( sortedBegin, nit );
+                                        if( distance >= m_findZone.minBinVal ) break;
+                                        sortedBegin = nit;
+                                    }
+                                    for( int64_t j = numBins - 1; j > i; j-- )
+                                    {
+                                        const auto nextBinVal = tmin + ( j - 1 ) * zmax / numBins;
+                                        auto nit = std::lower_bound( sortedBegin, sortedEnd, nextBinVal );
+                                        const auto distance = std::distance( nit, sortedEnd );
+                                        if( distance >= m_findZone.minBinVal ) break;
+                                        sortedEnd = nit;
+                                    }
+                                }
+
+                                if( sortedBegin != sorted.end() )
+                                {
+                                    tmin = *sortedBegin;
+                                    tmax = *( sortedEnd - 1 );
+                                    total = 0;
+                                    for( auto ptr = sortedBegin; ptr != sortedEnd; ptr++ ) total += *ptr;
+                                }
+                            }
+
+                            const auto distBegin = std::distance( sorted.begin(), sortedBegin );
+                            const auto distEnd = std::distance( sorted.begin(), sortedEnd );
+                            if( m_findZone.binCache.numBins != numBins ||
+                                m_findZone.binCache.distBegin != distBegin ||
+                                m_findZone.binCache.distEnd != distEnd )
+                            {
+                                m_findZone.binCache.numBins = numBins;
+                                m_findZone.binCache.distBegin = distBegin;
+                                m_findZone.binCache.distEnd = distEnd;
+
+                                memset( bins.get(), 0, sizeof( int64_t ) * numBins );
+                                memset( binTime.get(), 0, sizeof( int64_t ) * numBins );
+                                memset( selBin.get(), 0, sizeof( int64_t ) * numBins );
+
+                                int64_t selectionTime = 0;
+
+                                if( m_findZone.logTime )
+                                {
+                                    const auto tMinLog = log10( tmin );
+                                    const auto zmax = ( log10( tmax ) - tMinLog ) / numBins;
+                                    {
+                                        auto zit = sortedBegin;
+                                        for( int64_t i = 0; i < numBins; i++ )
+                                        {
+                                            const auto nextBinVal = int64_t( pow( 10.0, tMinLog + ( i + 1 ) * zmax ) );
+                                            auto nit = std::lower_bound( zit, sortedEnd, nextBinVal );
+                                            const auto distance = std::distance( zit, nit );
+                                            const auto timeSum = std::accumulate( zit, nit, int64_t( 0 ) );
+                                            bins[i] = distance;
+                                            binTime[i] = timeSum;
+                                            if( m_findZone.highlight.active && zit != sortedEnd )
+                                            {
+                                                auto end = nit == zit ? zit : nit - 1;
+                                                if( *zit >= s && *end <= e ) selectionTime += timeSum;
+                                            }
+                                            zit = nit;
+                                        }
+                                        if( zit != sortedEnd )
+                                        {
+                                            const auto timeSum = std::accumulate( zit, sortedEnd, int64_t( 0 ) );
+                                            bins[numBins - 1] += std::distance( zit, sortedEnd );
+                                            binTime[numBins - 1] += timeSum;
+                                            if( m_findZone.highlight.active && *zit >= s && *( sortedEnd - 1 ) <= e ) selectionTime += timeSum;
+                                        }
+                                    }
+
+                                    if( m_findZone.selGroup != m_findZone.Unselected )
+                                    {
+                                        auto zit = m_findZone.selSort.begin();
+                                        while( zit != m_findZone.selSort.end() && *zit == 0 ) ++zit;
+                                        for( int64_t i = 0; i < numBins; i++ )
+                                        {
+                                            const auto nextBinVal = int64_t( pow( 10.0, tMinLog + ( i + 1 ) * zmax ) );
+                                            auto nit = std::lower_bound( zit, m_findZone.selSort.end(), nextBinVal );
+                                            if( cumulateTime )
+                                            {
+                                                selBin[i] = std::accumulate( zit, nit, int64_t( 0 ) );
+                                            }
+                                            else
+                                            {
+                                                selBin[i] = std::distance( zit, nit );
+                                            }
+                                            zit = nit;
+                                        }
+                                    }
+                                }
+                                else
+                                {
+                                    const auto zmax = tmax - tmin;
                                     auto zit = sortedBegin;
                                     for( int64_t i=0; i<numBins; i++ )
                                     {
-                                        const auto nextBinVal = int64_t( pow( 10.0, tMinLog + ( i+1 ) * zmax ) );
+                                        const auto nextBinVal = tmin + ( i+1 ) * zmax / numBins;
                                         auto nit = std::lower_bound( zit, sortedEnd, nextBinVal );
                                         const auto distance = std::distance( zit, nit );
                                         const auto timeSum = std::accumulate( zit, nit, int64_t( 0 ) );
                                         bins[i] = distance;
                                         binTime[i] = timeSum;
-                                        if( m_findZone.highlight.active )
+                                        if( m_findZone.highlight.active && zit != sortedEnd )
                                         {
-                                            auto end = nit == zit ? zit : nit-1;
+                                            auto end = nit == zit ? zit : nit - 1;
                                             if( *zit >= s && *end <= e ) selectionTime += timeSum;
                                         }
                                         zit = nit;
                                     }
-                                    const auto timeSum = std::accumulate( zit, sortedEnd, int64_t( 0 ) );
-                                    bins[numBins-1] += std::distance( zit, sortedEnd );
-                                    binTime[numBins-1] += timeSum;
-                                    if( m_findZone.highlight.active && *zit >= s && *(sortedEnd-1) <= e ) selectionTime += timeSum;
-                                }
-
-                                if( m_findZone.selGroup != m_findZone.Unselected )
-                                {
-                                    auto zit = m_findZone.selSort.begin();
-                                    while( zit != m_findZone.selSort.end() && *zit == 0 ) ++zit;
-                                    for( int64_t i=0; i<numBins; i++ )
+                                    if( zit != sortedEnd )
                                     {
-                                        const auto nextBinVal = int64_t( pow( 10.0, tMinLog + ( i+1 ) * zmax ) );
-                                        auto nit = std::lower_bound( zit, m_findZone.selSort.end(), nextBinVal );
-                                        if( cumulateTime )
+                                        const auto timeSum = std::accumulate( zit, sortedEnd, int64_t( 0 ) );
+                                        bins[numBins - 1] += std::distance( zit, sortedEnd );
+                                        binTime[numBins - 1] += timeSum;
+                                        if( m_findZone.highlight.active && *zit >= s && *( sortedEnd - 1 ) <= e ) selectionTime += timeSum;
+                                    }
+
+                                    if( m_findZone.selGroup != m_findZone.Unselected )
+                                    {
+                                        auto zit = m_findZone.selSort.begin();
+                                        while( zit != m_findZone.selSort.end() && *zit == 0 ) ++zit;
+                                        for( int64_t i = 0; i < numBins; i++ )
                                         {
-                                            selBin[i] = std::accumulate( zit, nit, int64_t( 0 ) );
+                                            const auto nextBinVal = tmin + ( i + 1 ) * zmax / numBins;
+                                            auto nit = std::lower_bound( zit, m_findZone.selSort.end(), nextBinVal );
+                                            if( cumulateTime )
+                                            {
+                                                selBin[i] = std::accumulate( zit, nit, int64_t( 0 ) );
+                                            }
+                                            else
+                                            {
+                                                selBin[i] = std::distance( zit, nit );
+                                            }
+                                            zit = nit;
                                         }
-                                        else
-                                        {
-                                            selBin[i] = std::distance( zit, nit );
-                                        }
-                                        zit = nit;
                                     }
                                 }
+
+                                m_findZone.selTime = selectionTime;
                             }
-                            else
-                            {
-                                const auto zmax = tmax - tmin;
-                                auto zit = sortedBegin;
-                                for( int64_t i=0; i<numBins; i++ )
-                                {
-                                    const auto nextBinVal = tmin + ( i+1 ) * zmax / numBins;
-                                    auto nit = std::lower_bound( zit, sortedEnd, nextBinVal );
-                                    const auto distance = std::distance( zit, nit );
-                                    const auto timeSum = std::accumulate( zit, nit, int64_t( 0 ) );
-                                    bins[i] = distance;
-                                    binTime[i] = timeSum;
-                                    if( m_findZone.highlight.active )
-                                    {
-                                        auto end = nit == zit ? zit : nit-1;
-                                        if( *zit >= s && *end <= e ) selectionTime += timeSum;
-                                    }
-                                    zit = nit;
-                                }
-                                const auto timeSum = std::accumulate( zit, sortedEnd, int64_t( 0 ) );
-                                bins[numBins-1] += std::distance( zit, sortedEnd );
-                                binTime[numBins-1] += timeSum;
-                                if( m_findZone.highlight.active && *zit >= s && *(sortedEnd-1) <= e ) selectionTime += timeSum;
-
-                                if( m_findZone.selGroup != m_findZone.Unselected )
-                                {
-                                    auto zit = m_findZone.selSort.begin();
-                                    while( zit != m_findZone.selSort.end() && *zit == 0 ) ++zit;
-                                    for( int64_t i=0; i<numBins; i++ )
-                                    {
-                                        const auto nextBinVal = tmin + ( i+1 ) * zmax / numBins;
-                                        auto nit = std::lower_bound( zit, m_findZone.selSort.end(), nextBinVal );
-                                        if( cumulateTime )
-                                        {
-                                            selBin[i] = std::accumulate( zit, nit, int64_t( 0 ) );
-                                        }
-                                        else
-                                        {
-                                            selBin[i] = std::distance( zit, nit );
-                                        }
-                                        zit = nit;
-                                    }
-                                }
-                            }
-
-                            m_findZone.selTime = selectionTime;
                         }
 
                         int maxBin = 0;
@@ -1093,6 +1448,7 @@ void View::DrawFindZone()
                                 }
                             }
                         }
+                        const auto drawMaxVal = fixedReplayAxes ? fixedAxisMaxVal : maxVal;
 
                         TextFocused( "Total time:", TimeToString( total ) );
                         ImGui::SameLine();
@@ -1123,7 +1479,7 @@ void View::DrawFindZone()
                             }
                             TextFocused( "Mode:", TimeToString( ( t0 + t1 ) / 2 ) );
                         }
-                        if( !m_findZone.range.active && m_findZone.sorted.size() > 1 )
+                        if( !rangeActive && m_findZone.sorted.size() > 1 )
                         {
                             const auto sz = m_findZone.sorted.size();
                             const auto avg = m_findZone.average;
@@ -1243,7 +1599,7 @@ void View::DrawFindZone()
 
                         if( m_findZone.logVal )
                         {
-                            const auto hAdj = double( Height - 4 ) / log10( maxVal + 1 );
+                            const auto hAdj = double( Height - 4 ) / log10( drawMaxVal + 1 );
                             for( int i=0; i<numBins; i++ )
                             {
                                 const auto val = cumulateTime ? binTime[i] : bins[i];
@@ -1259,7 +1615,7 @@ void View::DrawFindZone()
                         }
                         else
                         {
-                            const auto hAdj = double( Height - 4 ) / maxVal;
+                            const auto hAdj = double( Height - 4 ) / drawMaxVal;
                             for( int i=0; i<numBins; i++ )
                             {
                                 const auto val = cumulateTime ? binTime[i] : bins[i];
@@ -1620,7 +1976,7 @@ void View::DrawFindZone()
         const auto hmax = std::max( m_findZone.highlight.start, m_findZone.highlight.end );
         const auto groupBy = m_findZone.groupBy;
         const auto highlightActive = m_findZone.highlight.active;
-        const auto limitRange = m_findZone.range.active;
+        const auto limitRange = rangeActive;
         FindZone::Group* group = nullptr;
         constexpr uint64_t invalidGid = std::numeric_limits<uint64_t>::max() - 1;
         uint64_t lastGid = invalidGid;
@@ -2052,7 +2408,7 @@ void View::DrawFindZone()
 
                 auto samplesBegin = samples->begin();
                 auto samplesEnd = samples->end();
-                if( m_findZone.range.active )
+                if( rangeActive )
                 {
                     const auto rangeMin = m_findZone.range.min;
                     const auto rangeMax = m_findZone.range.max;

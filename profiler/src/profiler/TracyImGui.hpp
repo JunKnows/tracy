@@ -5,6 +5,7 @@
 #  pragma warning( disable: 4244 )  // conversion from don't care to whatever, possible loss of data
 #endif
 
+#include <array>
 #include <math.h>
 #include <stdint.h>
 #include <vector>
@@ -189,6 +190,67 @@ static constexpr const uint32_t AsmSyntaxColors[] = {
     {
         return ImGui::SmallButton( label );
     }
+}
+
+// Replay toolbars expose three user-visible states: start from the beginning, resume from a
+// paused midpoint, or pause an actively running replay.
+enum class ReplayButtonAction
+{
+    Replay,
+    Continue,
+    Pause
+};
+
+[[maybe_unused]] static inline ReplayButtonAction GetReplayButtonAction( bool active, bool paused, int currentFrame, int endFrameExclusive )
+{
+    if( active && !paused ) return ReplayButtonAction::Pause;
+    if( active && paused && currentFrame < endFrameExclusive - 1 ) return ReplayButtonAction::Continue;
+    return ReplayButtonAction::Replay;
+}
+
+[[maybe_unused]] static inline const char* GetReplayButtonLabel( ReplayButtonAction action )
+{
+    switch( action )
+    {
+    case ReplayButtonAction::Replay: return ICON_FA_PLAY " Replay";
+    case ReplayButtonAction::Continue: return ICON_FA_PLAY " Continue";
+    case ReplayButtonAction::Pause: return ICON_FA_PAUSE " Pause";
+    default:
+        IM_ASSERT( false );
+        return "";
+    }
+}
+
+[[maybe_unused]] static inline float GetReplaySpeedComboWidth( float scale )
+{
+    return ImGui::CalcTextSize( "100x" ).x + ImGui::GetFrameHeight() + scale * 16;
+}
+
+// Small helper for combo boxes backed by a fixed label array and a byte-sized selection index.
+template<size_t N>
+[[maybe_unused]] static inline bool StringArrayCombo( const char* id, const std::array<const char*, N>& labels, uint8_t& selected )
+{
+    IM_ASSERT( selected < labels.size() );
+
+    bool changed = false;
+    if( ImGui::BeginCombo( id, labels[selected] ) )
+    {
+        for( uint8_t i = 0; i < labels.size(); i++ )
+        {
+            const bool isSelected = selected == i;
+            if( ImGui::Selectable( labels[i], isSelected ) )
+            {
+                selected = i;
+                changed = true;
+            }
+            if( isSelected )
+            {
+                ImGui::SetItemDefaultFocus();
+            }
+        }
+        ImGui::EndCombo();
+    }
+    return changed;
 }
 
 [[maybe_unused]] static inline void DrawTextContrast( ImDrawList* draw, const ImVec2& pos, uint32_t color, const char* text )

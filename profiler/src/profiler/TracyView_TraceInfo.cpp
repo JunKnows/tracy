@@ -11,11 +11,74 @@ namespace tracy
 
 extern double s_time;
 
+void View::ResetFrameSortData()
+{
+    m_frameSortData.frameSet = nullptr;
+    m_frameSortData.frameNum = 0;
+    m_frameSortData.data.clear();
+    m_frameSortData.average = 0;
+    m_frameSortData.median = 0;
+    m_frameSortData.total = 0;
+    m_frameSortData.limitRange = { -1, 0 };
+}
+
+void View::ResetFrameSortPlayback()
+{
+    const auto speed = m_frameSortData.playback.speed;
+    m_frameSortData.playback = {};
+    m_frameSortData.playback.speed = speed;
+}
+
+void View::SetFrameSortPlaybackFrame( int idx )
+{
+    auto& playback = m_frameSortData.playback;
+    playback.currentFrame = idx;
+    if( idx >= playback.targetRange.second - 1 )
+    {
+        playback.pause = true;
+        playback.timeLeft = 0;
+    }
+    else
+    {
+        const auto frameTime = std::max<int64_t>( m_worker.GetFrameTime( *playback.frameSet, idx ), 1 );
+        playback.timeLeft = frameTime / 1000000000.f;
+    }
+}
+
+void View::StartFrameSortPlayback( std::pair<int, int> range )
+{
+    if( range.first >= range.second )
+    {
+        ResetFrameSortPlayback();
+        return;
+    }
+
+    ResetFrameSortData();
+
+    auto& playback = m_frameSortData.playback;
+    playback.frameSet = m_frames;
+    playback.targetRange = range;
+    playback.fullData.clear();
+    playback.fullData.reserve( range.second - range.first );
+    for( int i = range.first; i < range.second; i++ )
+    {
+        const auto t = m_worker.GetFrameTime( *m_frames, i );
+        if( t > 0 ) playback.fullData.emplace_back( t );
+    }
+    pdqsort_branchless( playback.fullData.begin(), playback.fullData.end() );
+    playback.limitToView = m_frameSortData.limitToView;
+    playback.active = true;
+    playback.pause = false;
+
+    SetFrameSortPlaybackFrame( range.first + ( range.second - range.first > 1 ? 1 : 0 ) );
+}
+
 void View::DrawInfo()
 {
     const auto scale = GetScale();
     ImGui::SetNextWindowSize( ImVec2( 400 * scale, 650 * scale ), ImGuiCond_FirstUseEver );
     ImGui::Begin( "Trace information", &m_showInfo, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse );
+    if( !m_showInfo ) m_frameSortData.playback.pause = true;
     if( ImGui::GetCurrentWindowRead()->SkipItems ) { ImGui::End(); return; }
     ImGui::PushFont( g_fonts.normal, FontBig );
     TextFocused( "Program:", m_worker.GetCaptureProgram().c_str() );
@@ -223,93 +286,179 @@ void View::DrawInfo()
                 TextColoredUnformatted( 0xFF00FFFF, ICON_FA_TRIANGLE_EXCLAMATION );
             }
 
-            const auto frameRange = m_worker.GetFrameRange( *m_frames, m_vd.zvStart, m_vd.zvEnd );
-            if( m_frameSortData.frameSet != m_frames || ( m_frameSortData.limitToView && m_frameSortData.limitRange != frameRange ) || ( !m_frameSortData.limitToView && m_frameSortData.limitRange.first != -1 ) )
+            const auto viewFrameRange = m_worker.GetFrameRange( *m_frames, m_vd.zvStart, m_vd.zvEnd );
+            const auto liveFrameRange = m_frameSortData.limitToView ? viewFrameRange : std::make_pair( 0, int( fsz ) );
+            const auto replayDisabled = liveFrameRange.first >= liveFrameRange.second;
+            const auto replayActive = m_frameSortData.playback.active;
+            const auto replayAction = GetReplayButtonAction( replayActive, m_frameSortData.playback.pause, m_frameSortData.playback.currentFrame, m_frameSortData.playback.targetRange.second );
+            const auto replayRunning = replayAction == ReplayButtonAction::Pause;
+            const auto replayCanExit = replayActive && m_frameSortData.playback.pause;
+            const auto replayLabel = GetReplayButtonLabel( replayAction );
+
+            ImGui::SameLine();
+            if( SmallButtonDisablable( replayLabel, replayDisabled ) )
             {
+                if( replayRunning )
+                {
+                    m_frameSortData.playback.pause = true;
+                }
+                else if( replayAction == ReplayButtonAction::Continue )
+                {
+                    m_frameSortData.playback.pause = false;
+                }
+                else
+                {
+                    StartFrameSortPlayback( liveFrameRange );
+                }
+            }
+
+            ImGui::SameLine();
+            ImGui::TextDisabled( "Speed:" );
+            ImGui::SameLine();
+            if( replayDisabled ) ImGui::BeginDisabled();
+            ImGui::PushStyleVar( ImGuiStyleVar_FramePadding, ImVec2( 0, 0 ) );
+            ImGui::SetNextItemWidth( GetReplaySpeedComboWidth( scale ) );
+            StringArrayCombo( "##frameReplaySpeed", StatisticsReplaySpeedLabels, m_frameSortData.playback.speed );
+            ImGui::PopStyleVar();
+            if( replayDisabled ) ImGui::EndDisabled();
+
+            ImGui::SameLine();
+            if( SmallButtonDisablable( ICON_FA_XMARK " Exit", !replayCanExit ) )
+            {
+                ResetFrameSortPlayback();
+                ResetFrameSortData();
+            }
+
+            if( m_frameSortData.playback.active )
+            {
+                const auto currentReplayFrame = m_frameSortData.playback.currentFrame - m_frameSortData.playback.targetRange.first + 1;
+                const auto totalReplayFrames = m_frameSortData.playback.targetRange.second - m_frameSortData.playback.targetRange.first;
+                ImGui::SameLine();
+                ImGui::TextDisabled( "(%s/%s)", RealToString( currentReplayFrame ), RealToString( totalReplayFrames ) );
+            }
+
+            if( m_frameSortData.playback.active && ( m_frameSortData.playback.frameSet != m_frames || m_frameSortData.playback.limitToView != m_frameSortData.limitToView ) )
+            {
+                ResetFrameSortPlayback();
+                ResetFrameSortData();
+            }
+
+            if( m_frameSortData.playback.active && !m_frameSortData.playback.pause )
+            {
+                auto time = ImGui::GetIO().DeltaTime * StatisticsReplaySpeeds[m_frameSortData.playback.speed];
+                while( !m_frameSortData.playback.pause && time > 0 )
+                {
+                    const auto dt = std::min( time, m_frameSortData.playback.timeLeft );
+                    time -= dt;
+                    m_frameSortData.playback.timeLeft -= dt;
+                    if( m_frameSortData.playback.timeLeft <= 0 )
+                    {
+                        if( m_frameSortData.playback.currentFrame + 1 < m_frameSortData.playback.targetRange.second )
+                        {
+                            SetFrameSortPlaybackFrame( m_frameSortData.playback.currentFrame + 1 );
+                        }
+                        else
+                        {
+                            m_frameSortData.playback.pause = true;
+                        }
+                    }
+                }
+                m_wasActive.store( true, std::memory_order_release );
+            }
+
+            const auto targetFrameRange = m_frameSortData.playback.active ? m_frameSortData.playback.targetRange : liveFrameRange;
+            auto activeFrameRange = targetFrameRange;
+            if( m_frameSortData.playback.active )
+            {
+                activeFrameRange.second = std::min( m_frameSortData.playback.currentFrame + 1, targetFrameRange.second );
+            }
+
+            if( m_frameSortData.frameSet != m_frames ||
+                m_frameSortData.limitRange.first != activeFrameRange.first ||
+                m_frameSortData.frameNum < size_t( activeFrameRange.first ) ||
+                m_frameSortData.frameNum > size_t( activeFrameRange.second ) )
+            {
+                ResetFrameSortData();
                 m_frameSortData.frameSet = m_frames;
-                m_frameSortData.frameNum = 0;
-                m_frameSortData.data.clear();
-                m_frameSortData.total = 0;
+                m_frameSortData.frameNum = activeFrameRange.first;
+                m_frameSortData.limitRange = { activeFrameRange.first, activeFrameRange.first };
             }
+
             bool recalc = false;
-            int64_t total = 0;
-            if( !m_frameSortData.limitToView )
+            auto total = m_frameSortData.total;
+            if( m_frameSortData.frameNum != size_t( activeFrameRange.second ) )
             {
-                if( m_frameSortData.frameNum != fsz || m_frameSortData.limitRange.first != -1 )
+                auto& vec = m_frameSortData.data;
+                vec.reserve( activeFrameRange.second - activeFrameRange.first );
+                const auto midSz = vec.size();
+                for( size_t i = m_frameSortData.frameNum; i < size_t( activeFrameRange.second ); i++ )
                 {
-                    auto& vec = m_frameSortData.data;
-                    vec.reserve( fsz );
-                    const auto midSz = vec.size();
-                    total = m_frameSortData.total;
-                    for( size_t i=m_frameSortData.frameNum; i<fsz; i++ )
+                    const auto t = m_worker.GetFrameTime( *m_frames, i );
+                    if( t > 0 )
                     {
-                        const auto t = m_worker.GetFrameTime( *m_frames, i );
-                        if( t > 0 )
-                        {
-                            vec.emplace_back( t );
-                            total += t;
-                        }
+                        vec.emplace_back( t );
+                        total += t;
                     }
-                    auto mid = vec.begin() + midSz;
-                    pdqsort_branchless( mid, vec.end() );
-                    std::inplace_merge( vec.begin(), mid, vec.end() );
-                    recalc = true;
-                    m_frameSortData.limitRange.first = -1;
                 }
+                auto mid = vec.begin() + midSz;
+                pdqsort_branchless( mid, vec.end() );
+                std::inplace_merge( vec.begin(), mid, vec.end() );
+                m_frameSortData.frameNum = activeFrameRange.second;
+                recalc = true;
             }
-            else
-            {
-                if( m_frameSortData.limitRange != frameRange )
-                {
-                    auto& vec = m_frameSortData.data;
-                    assert( vec.empty() );
-                    vec.reserve( frameRange.second - frameRange.first );
-                    for( int i=frameRange.first; i<frameRange.second; i++ )
-                    {
-                        const auto t = m_worker.GetFrameTime( *m_frames, i );
-                        if( t > 0 )
-                        {
-                            vec.emplace_back( t );
-                            total += t;
-                        }
-                    }
-                    pdqsort_branchless( vec.begin(), vec.end() );
-                    recalc = true;
-                    m_frameSortData.limitRange = frameRange;
-                }
-            }
+            m_frameSortData.limitRange = activeFrameRange;
+
             if( recalc )
             {
                 auto& vec = m_frameSortData.data;
                 const auto vsz = vec.size();
-                m_frameSortData.average = float( total ) / vsz;
-                m_frameSortData.median = vec[vsz/2];
                 m_frameSortData.total = total;
-                m_frameSortData.frameNum = fsz;
+                if( vsz != 0 )
+                {
+                    m_frameSortData.average = float( total ) / vsz;
+                    m_frameSortData.median = vec[vsz / 2];
+                }
+                else
+                {
+                    m_frameSortData.average = 0;
+                    m_frameSortData.median = 0;
+                }
             }
 
             const auto profileSpan = m_worker.GetLastTime();
-            TextFocused( "Count:", RealToString( fsz ) );
+            const auto activeFrameCount = activeFrameRange.second - activeFrameRange.first;
+            TextFocused( "Count:", RealToString( activeFrameCount ) );
+            if( activeFrameCount != int( fsz ) )
+            {
+                ImGui::SameLine();
+                ImGui::TextDisabled( "(%s total)", RealToString( fsz ) );
+            }
             TextFocused( "Total time:", TimeToString( m_frameSortData.total ) );
             ImGui::SameLine();
             ImGui::TextDisabled( "(%.2f%% of profile time span)", m_frameSortData.total / float( profileSpan ) * 100.f );
             TextFocused( "Mean frame time:", TimeToString( m_frameSortData.average ) );
-            ImGui::SameLine();
-            ImGui::TextDisabled( "(%s FPS)", RealToString( round( 1000000000.0 / m_frameSortData.average ) ) );
-            if( ImGui::IsItemHovered() )
+            if( m_frameSortData.average > 0 )
             {
-                ImGui::BeginTooltip();
-                ImGui::Text( "%s FPS", RealToString( 1000000000.0 / m_frameSortData.average ) );
-                ImGui::EndTooltip();
+                ImGui::SameLine();
+                ImGui::TextDisabled( "(%s FPS)", RealToString( round( 1000000000.0 / m_frameSortData.average ) ) );
+                if( ImGui::IsItemHovered() )
+                {
+                    ImGui::BeginTooltip();
+                    ImGui::Text( "%s FPS", RealToString( 1000000000.0 / m_frameSortData.average ) );
+                    ImGui::EndTooltip();
+                }
             }
             TextFocused( "Median frame time:", TimeToString( m_frameSortData.median ) );
-            ImGui::SameLine();
-            ImGui::TextDisabled( "(%s FPS)", RealToString( round( 1000000000.0 / m_frameSortData.median ) ) );
-            if( ImGui::IsItemHovered() )
+            if( m_frameSortData.median > 0 )
             {
-                ImGui::BeginTooltip();
-                ImGui::Text( "%s FPS", RealToString( 1000000000.0 / m_frameSortData.median ) );
-                ImGui::EndTooltip();
+                ImGui::SameLine();
+                ImGui::TextDisabled( "(%s FPS)", RealToString( round( 1000000000.0 / m_frameSortData.median ) ) );
+                if( ImGui::IsItemHovered() )
+                {
+                    ImGui::BeginTooltip();
+                    ImGui::Text( "%s FPS", RealToString( 1000000000.0 / m_frameSortData.median ) );
+                    ImGui::EndTooltip();
+                }
             }
 
             if( ImGui::TreeNodeEx( "Histogram", ImGuiTreeNodeFlags_DefaultOpen ) )
@@ -317,176 +466,322 @@ void View::DrawInfo()
                 const auto ty = ImGui::GetTextLineHeight();
 
                 auto& frames = m_frameSortData.data;
-                auto tmin = frames.front();
-                auto tmax = frames.back();
-
-                if( tmin != std::numeric_limits<int64_t>::max() )
+                if( frames.empty() )
                 {
-                    TextDisabledUnformatted( "Minimum values in bin:" );
-                    ImGui::SameLine();
-                    ImGui::SetNextItemWidth( ImGui::CalcTextSize( "123456890123456" ).x );
-                    ImGui::PushStyleVar( ImGuiStyleVar_FramePadding, ImVec2( 1, 1 ) );
-                    ImGui::InputInt( "##minBinVal", &m_frameSortData.minBinVal );
-                    if( m_frameSortData.minBinVal < 1 ) m_frameSortData.minBinVal = 1;
-                    ImGui::SameLine();
-                    if( ImGui::Button( "Reset" ) ) m_frameSortData.minBinVal = 1;
-                    ImGui::PopStyleVar();
+                    ImGui::TextDisabled( "No frame data in selected range." );
+                }
+                else
+                {
+                    auto tmin = frames.front();
+                    auto tmax = frames.back();
 
-                    SmallCheckbox( "Log values", &m_frameSortData.logVal );
-                    ImGui::SameLine();
-                    SmallCheckbox( "Log time", &m_frameSortData.logTime );
-
-                    TextDisabledUnformatted( "FPS range:" );
-                    ImGui::SameLine();
-                    ImGui::Text( "%s FPS - %s FPS", RealToString( round( 1000000000.0 / tmin ) ), RealToString( round( 1000000000.0 / tmax ) ) );
-
-                    if( tmax - tmin > 0 )
+                    if( tmin != std::numeric_limits<int64_t>::max() )
                     {
-                        const auto w = ImGui::GetContentRegionAvail().x;
+                        TextDisabledUnformatted( "Minimum values in bin:" );
+                        ImGui::SameLine();
+                        ImGui::SetNextItemWidth( ImGui::CalcTextSize( "123456890123456" ).x );
+                        ImGui::PushStyleVar( ImGuiStyleVar_FramePadding, ImVec2( 1, 1 ) );
+                        ImGui::InputInt( "##minBinVal", &m_frameSortData.minBinVal );
+                        if( m_frameSortData.minBinVal < 1 ) m_frameSortData.minBinVal = 1;
+                        ImGui::SameLine();
+                        if( ImGui::Button( "Reset" ) ) m_frameSortData.minBinVal = 1;
+                        ImGui::PopStyleVar();
 
-                        const auto numBins = int64_t( w - 4 );
-                        if( numBins > 1 )
+                        SmallCheckbox( "Log values", &m_frameSortData.logVal );
+                        ImGui::SameLine();
+                        SmallCheckbox( "Log time", &m_frameSortData.logTime );
+
+                        TextDisabledUnformatted( "FPS range:" );
+                        ImGui::SameLine();
+                        ImGui::Text( "%s FPS - %s FPS", RealToString( round( 1000000000.0 / tmin ) ), RealToString( round( 1000000000.0 / tmax ) ) );
+
+                        if( tmax - tmin > 0 )
                         {
-                            if( numBins > m_frameSortData.numBins )
+                            const auto w = ImGui::GetContentRegionAvail().x;
+
+                            const auto numBins = int64_t( w - 4 );
+                            if( numBins > 1 )
                             {
-                                m_frameSortData.numBins = numBins;
-                                m_frameSortData.bins = std::make_unique<int64_t[]>( numBins );
-                            }
-
-                            const auto& bins = m_frameSortData.bins;
-
-                            memset( bins.get(), 0, sizeof( int64_t ) * numBins );
-
-                            auto framesBegin = frames.begin();
-                            auto framesEnd = frames.end();
-                            while( framesBegin != framesEnd && *framesBegin == 0 ) ++framesBegin;
-
-                            if( m_frameSortData.minBinVal > 1 )
-                            {
-                                if( m_frameSortData.logTime )
+                                if( numBins > m_frameSortData.numBins )
                                 {
-                                    const auto tMinLog = log10( tmin );
-                                    const auto zmax = ( log10( tmax ) - tMinLog ) / numBins;
-                                    int64_t i;
-                                    for( i=0; i<numBins; i++ )
-                                    {
-                                        const auto nextBinVal = int64_t( pow( 10.0, tMinLog + ( i+1 ) * zmax ) );
-                                        auto nit = std::lower_bound( framesBegin, framesEnd, nextBinVal );
-                                        const auto distance = std::distance( framesBegin, nit );
-                                        if( distance >= m_frameSortData.minBinVal ) break;
-                                        framesBegin = nit;
-                                    }
-                                    for( int64_t j=numBins-1; j>i; j-- )
-                                    {
-                                        const auto nextBinVal = int64_t( pow( 10.0, tMinLog + ( j-1 ) * zmax ) );
-                                        auto nit = std::lower_bound( framesBegin, framesEnd, nextBinVal );
-                                        const auto distance = std::distance( nit, framesEnd );
-                                        if( distance >= m_frameSortData.minBinVal ) break;
-                                        framesEnd = nit;
-                                    }
-                                }
-                                else
-                                {
-                                    const auto zmax = tmax - tmin;
-                                    int64_t i;
-                                    for( i=0; i<numBins; i++ )
-                                    {
-                                        const auto nextBinVal = tmin + ( i+1 ) * zmax / numBins;
-                                        auto nit = std::lower_bound( framesBegin, framesEnd, nextBinVal );
-                                        const auto distance = std::distance( framesBegin, nit );
-                                        if( distance >= m_frameSortData.minBinVal ) break;
-                                        framesBegin = nit;
-                                    }
-                                    for( int64_t j=numBins-1; j>i; j-- )
-                                    {
-                                        const auto nextBinVal = tmin + ( j-1 ) * zmax / numBins;
-                                        auto nit = std::lower_bound( framesBegin, framesEnd, nextBinVal );
-                                        const auto distance = std::distance( nit, framesEnd );
-                                        if( distance >= m_frameSortData.minBinVal ) break;
-                                        framesEnd = nit;
-                                    }
+                                    m_frameSortData.numBins = numBins;
+                                    m_frameSortData.bins = std::make_unique<int64_t[]>( numBins );
                                 }
 
-                                tmin = *framesBegin;
-                                tmax = *(framesEnd-1);
-                            }
+                                const auto& bins = m_frameSortData.bins;
 
-                            if( m_frameSortData.logTime )
-                            {
-                                const auto tMinLog = log10( tmin );
-                                const auto zmax = ( log10( tmax ) - tMinLog ) / numBins;
-                                auto fit = framesBegin;
-                                for( int64_t i=0; i<numBins; i++ )
+                                memset( bins.get(), 0, sizeof( int64_t ) * numBins );
+
+                                auto framesBegin = frames.begin();
+                                auto framesEnd = frames.end();
+                                while( framesBegin != framesEnd && *framesBegin == 0 ) ++framesBegin;
+
+                                int64_t fixedAxisMaxVal = 0;
+                                bool fixedReplayAxes = m_frameSortData.playback.active && !m_frameSortData.playback.fullData.empty();
+                                if( fixedReplayAxes )
                                 {
-                                    const auto nextBinVal = int64_t( pow( 10.0, tMinLog + ( i+1 ) * zmax ) );
-                                    auto nit = std::lower_bound( fit, framesEnd, nextBinVal );
-                                    bins[i] = std::distance( fit, nit );
-                                    fit = nit;
+                                    auto axisBegin = m_frameSortData.playback.fullData.begin();
+                                    auto axisEnd = m_frameSortData.playback.fullData.end();
+                                    while( axisBegin != axisEnd && *axisBegin == 0 ) ++axisBegin;
+
+                                    if( axisBegin == axisEnd )
+                                    {
+                                        fixedReplayAxes = false;
+                                    }
+                                    else
+                                    {
+                                        tmin = *axisBegin;
+                                        tmax = *( axisEnd - 1 );
+
+                                        if( m_frameSortData.minBinVal > 1 )
+                                        {
+                                            if( m_frameSortData.logTime )
+                                            {
+                                                const auto tMinLog = log10( tmin );
+                                                const auto zmax = ( log10( tmax ) - tMinLog ) / numBins;
+                                                int64_t i;
+                                                for( i = 0; i < numBins; i++ )
+                                                {
+                                                    const auto nextBinVal = int64_t( pow( 10.0, tMinLog + ( i + 1 ) * zmax ) );
+                                                    auto nit = std::lower_bound( axisBegin, axisEnd, nextBinVal );
+                                                    const auto distance = std::distance( axisBegin, nit );
+                                                    if( distance >= m_frameSortData.minBinVal ) break;
+                                                    axisBegin = nit;
+                                                }
+                                                for( int64_t j = numBins - 1; j > i; j-- )
+                                                {
+                                                    const auto nextBinVal = int64_t( pow( 10.0, tMinLog + ( j - 1 ) * zmax ) );
+                                                    auto nit = std::lower_bound( axisBegin, axisEnd, nextBinVal );
+                                                    const auto distance = std::distance( nit, axisEnd );
+                                                    if( distance >= m_frameSortData.minBinVal ) break;
+                                                    axisEnd = nit;
+                                                }
+                                            }
+                                            else
+                                            {
+                                                const auto zmax = tmax - tmin;
+                                                int64_t i;
+                                                for( i = 0; i < numBins; i++ )
+                                                {
+                                                    const auto nextBinVal = tmin + ( i + 1 ) * zmax / numBins;
+                                                    auto nit = std::lower_bound( axisBegin, axisEnd, nextBinVal );
+                                                    const auto distance = std::distance( axisBegin, nit );
+                                                    if( distance >= m_frameSortData.minBinVal ) break;
+                                                    axisBegin = nit;
+                                                }
+                                                for( int64_t j = numBins - 1; j > i; j-- )
+                                                {
+                                                    const auto nextBinVal = tmin + ( j - 1 ) * zmax / numBins;
+                                                    auto nit = std::lower_bound( axisBegin, axisEnd, nextBinVal );
+                                                    const auto distance = std::distance( nit, axisEnd );
+                                                    if( distance >= m_frameSortData.minBinVal ) break;
+                                                    axisEnd = nit;
+                                                }
+                                            }
+                                        }
+
+                                        if( axisBegin == axisEnd )
+                                        {
+                                            fixedReplayAxes = false;
+                                        }
+                                        else
+                                        {
+                                            tmin = *axisBegin;
+                                            tmax = *( axisEnd - 1 );
+                                            if( tmax <= tmin )
+                                            {
+                                                fixedReplayAxes = false;
+                                            }
+                                            else
+                                            {
+                                                std::vector<int64_t> axisBins( numBins, 0 );
+                                                if( m_frameSortData.logTime )
+                                                {
+                                                    const auto tMinLog = log10( tmin );
+                                                    const auto zmax = ( log10( tmax ) - tMinLog ) / numBins;
+
+                                                    auto axisFit = axisBegin;
+                                                    for( int64_t i = 0; i < numBins; i++ )
+                                                    {
+                                                        const auto nextBinVal = int64_t( pow( 10.0, tMinLog + ( i + 1 ) * zmax ) );
+                                                        auto nit = std::lower_bound( axisFit, axisEnd, nextBinVal );
+                                                        axisBins[i] = std::distance( axisFit, nit );
+                                                        axisFit = nit;
+                                                    }
+                                                    axisBins[numBins - 1] += std::distance( axisFit, axisEnd );
+
+                                                    auto fit = std::lower_bound( framesBegin, framesEnd, tmin );
+                                                    const auto replayEnd = std::upper_bound( fit, framesEnd, tmax );
+                                                    for( int64_t i = 0; i < numBins; i++ )
+                                                    {
+                                                        const auto nextBinVal = int64_t( pow( 10.0, tMinLog + ( i + 1 ) * zmax ) );
+                                                        auto nit = std::lower_bound( fit, replayEnd, nextBinVal );
+                                                        bins[i] = std::distance( fit, nit );
+                                                        fit = nit;
+                                                    }
+                                                    bins[numBins - 1] += std::distance( fit, replayEnd );
+                                                }
+                                                else
+                                                {
+                                                    const auto zmax = tmax - tmin;
+
+                                                    auto axisFit = axisBegin;
+                                                    for( int64_t i = 0; i < numBins; i++ )
+                                                    {
+                                                        const auto nextBinVal = tmin + ( i + 1 ) * zmax / numBins;
+                                                        auto nit = std::lower_bound( axisFit, axisEnd, nextBinVal );
+                                                        axisBins[i] = std::distance( axisFit, nit );
+                                                        axisFit = nit;
+                                                    }
+                                                    axisBins[numBins - 1] += std::distance( axisFit, axisEnd );
+
+                                                    auto fit = std::lower_bound( framesBegin, framesEnd, tmin );
+                                                    const auto replayEnd = std::upper_bound( fit, framesEnd, tmax );
+                                                    for( int64_t i = 0; i < numBins; i++ )
+                                                    {
+                                                        const auto nextBinVal = tmin + ( i + 1 ) * zmax / numBins;
+                                                        auto nit = std::lower_bound( fit, replayEnd, nextBinVal );
+                                                        bins[i] = std::distance( fit, nit );
+                                                        fit = nit;
+                                                    }
+                                                    bins[numBins - 1] += std::distance( fit, replayEnd );
+                                                }
+
+                                                fixedAxisMaxVal = *std::max_element( axisBins.begin(), axisBins.end() );
+                                            }
+                                        }
+                                    }
                                 }
-                                bins[numBins-1] += std::distance( fit, framesEnd );
+
+                                if( !fixedReplayAxes )
+                                {
+                                    if( m_frameSortData.minBinVal > 1 )
+                                    {
+                                        if( m_frameSortData.logTime )
+                                        {
+                                            const auto tMinLog = log10( tmin );
+                                            const auto zmax = ( log10( tmax ) - tMinLog ) / numBins;
+                                            int64_t i;
+                                            for( i = 0; i < numBins; i++ )
+                                            {
+                                                const auto nextBinVal = int64_t( pow( 10.0, tMinLog + ( i + 1 ) * zmax ) );
+                                                auto nit = std::lower_bound( framesBegin, framesEnd, nextBinVal );
+                                                const auto distance = std::distance( framesBegin, nit );
+                                                if( distance >= m_frameSortData.minBinVal ) break;
+                                                framesBegin = nit;
+                                            }
+                                            for( int64_t j = numBins - 1; j > i; j-- )
+                                            {
+                                                const auto nextBinVal = int64_t( pow( 10.0, tMinLog + ( j - 1 ) * zmax ) );
+                                                auto nit = std::lower_bound( framesBegin, framesEnd, nextBinVal );
+                                                const auto distance = std::distance( nit, framesEnd );
+                                                if( distance >= m_frameSortData.minBinVal ) break;
+                                                framesEnd = nit;
+                                            }
+                                        }
+                                        else
+                                        {
+                                            const auto zmax = tmax - tmin;
+                                            int64_t i;
+                                            for( i = 0; i < numBins; i++ )
+                                            {
+                                                const auto nextBinVal = tmin + ( i + 1 ) * zmax / numBins;
+                                                auto nit = std::lower_bound( framesBegin, framesEnd, nextBinVal );
+                                                const auto distance = std::distance( framesBegin, nit );
+                                                if( distance >= m_frameSortData.minBinVal ) break;
+                                                framesBegin = nit;
+                                            }
+                                            for( int64_t j = numBins - 1; j > i; j-- )
+                                            {
+                                                const auto nextBinVal = tmin + ( j - 1 ) * zmax / numBins;
+                                                auto nit = std::lower_bound( framesBegin, framesEnd, nextBinVal );
+                                                const auto distance = std::distance( nit, framesEnd );
+                                                if( distance >= m_frameSortData.minBinVal ) break;
+                                                framesEnd = nit;
+                                            }
+                                        }
+
+                                        tmin = *framesBegin;
+                                        tmax = *( framesEnd - 1 );
+                                    }
+
+                                    if( m_frameSortData.logTime )
+                                    {
+                                        const auto tMinLog = log10( tmin );
+                                        const auto zmax = ( log10( tmax ) - tMinLog ) / numBins;
+                                        auto fit = framesBegin;
+                                        for( int64_t i = 0; i < numBins; i++ )
+                                        {
+                                            const auto nextBinVal = int64_t( pow( 10.0, tMinLog + ( i + 1 ) * zmax ) );
+                                            auto nit = std::lower_bound( fit, framesEnd, nextBinVal );
+                                            bins[i] = std::distance( fit, nit );
+                                            fit = nit;
+                                        }
+                                        bins[numBins - 1] += std::distance( fit, framesEnd );
+                                    }
+                                    else
+                                    {
+                                        const auto zmax = tmax - tmin;
+                                        auto fit = framesBegin;
+                                        for( int64_t i = 0; i < numBins; i++ )
+                                        {
+                                            const auto nextBinVal = tmin + ( i + 1 ) * zmax / numBins;
+                                            auto nit = std::lower_bound( fit, framesEnd, nextBinVal );
+                                            bins[i] = std::distance( fit, nit );
+                                            fit = nit;
+                                        }
+                                        bins[numBins - 1] += std::distance( fit, framesEnd );
+                                    }
+                                }
+                                int64_t maxVal = bins[0];
+                                for( int i = 1; i < numBins; i++ )
+                                {
+                                    maxVal = std::max( maxVal, bins[i] );
+                                }
+                                const auto drawMaxVal = fixedReplayAxes ? fixedAxisMaxVal : maxVal;
+
+                                TextFocused( "Max counts:", RealToString( maxVal ) );
+
+                                ImGui::PushStyleVar( ImGuiStyleVar_FramePadding, ImVec2( 0, 0 ) );
+                                ImGui::Checkbox( "###draw1", &m_frameSortData.drawAvgMed );
+                                ImGui::SameLine();
+                                ImGui::ColorButton( "c1", ImVec4( 0xFF / 255.f, 0x44 / 255.f, 0x44 / 255.f, 1.f ), ImGuiColorEditFlags_NoTooltip | ImGuiColorEditFlags_NoDragDrop );
+                                ImGui::SameLine();
+                                ImGui::TextUnformatted( "Mean time" );
+                                ImGui::SameLine();
+                                ImGui::Spacing();
+                                ImGui::SameLine();
+                                ImGui::ColorButton( "c2", ImVec4( 0x44 / 255.f, 0x88 / 255.f, 0xFF / 255.f, 1.f ), ImGuiColorEditFlags_NoTooltip | ImGuiColorEditFlags_NoDragDrop );
+                                ImGui::SameLine();
+                                ImGui::TextUnformatted( "Median time" );
+                                ImGui::PopStyleVar();
+
+                                const auto Height = 200 * scale;
+                                const auto wpos = ImGui::GetCursorScreenPos();
+                                const auto dpos = wpos + ImVec2( 0.5f, 0.5f );
+
+                                ImGui::InvisibleButton( "##histogram", ImVec2( w, Height + round( ty * 2.5 ) ) );
+                                const bool hover = ImGui::IsItemHovered();
+
+                                auto draw = ImGui::GetWindowDrawList();
+                                draw->AddRectFilled( wpos, wpos + ImVec2( w, Height ), 0x22FFFFFF );
+                                draw->AddRect( wpos, wpos + ImVec2( w, Height ), 0x88FFFFFF );
+
+                                if( m_frameSortData.logVal )
+                                {
+                                    const auto hAdj = double( Height - 4 ) / log10( drawMaxVal + 1 );
+                                    for( int i = 0; i < numBins; i++ )
+                                    {
+                                        const auto val = bins[i];
+                                        if( val > 0 )
+                                        {
+                                            DrawLine( draw, dpos + ImVec2( 2 + i, Height - 3 ), dpos + ImVec2( 2 + i, Height - 3 - log10( val + 1 ) * hAdj ), 0xFF22DDDD );
+                                        }
+                                    }
                             }
                             else
                             {
-                                const auto zmax = tmax - tmin;
-                                auto fit = framesBegin;
-                                for( int64_t i=0; i<numBins; i++ )
-                                {
-                                    const auto nextBinVal = tmin + ( i+1 ) * zmax / numBins;
-                                    auto nit = std::lower_bound( fit, framesEnd, nextBinVal );
-                                    bins[i] = std::distance( fit, nit );
-                                    fit = nit;
-                                }
-                                bins[numBins-1] += std::distance( fit, framesEnd );
-                            }
-
-                            int64_t maxVal = bins[0];
-                            for( int i=1; i<numBins; i++ )
-                            {
-                                maxVal = std::max( maxVal, bins[i] );
-                            }
-
-                            TextFocused( "Max counts:", RealToString( maxVal ) );
-
-                            ImGui::PushStyleVar( ImGuiStyleVar_FramePadding, ImVec2( 0, 0 ) );
-                            ImGui::Checkbox( "###draw1", &m_frameSortData.drawAvgMed );
-                            ImGui::SameLine();
-                            ImGui::ColorButton( "c1", ImVec4( 0xFF/255.f, 0x44/255.f, 0x44/255.f, 1.f ), ImGuiColorEditFlags_NoTooltip | ImGuiColorEditFlags_NoDragDrop );
-                            ImGui::SameLine();
-                            ImGui::TextUnformatted( "Mean time" );
-                            ImGui::SameLine();
-                            ImGui::Spacing();
-                            ImGui::SameLine();
-                            ImGui::ColorButton( "c2", ImVec4( 0x44/255.f, 0x88/255.f, 0xFF/255.f, 1.f ), ImGuiColorEditFlags_NoTooltip | ImGuiColorEditFlags_NoDragDrop );
-                            ImGui::SameLine();
-                            ImGui::TextUnformatted( "Median time" );
-                            ImGui::PopStyleVar();
-
-                            const auto Height = 200 * scale;
-                            const auto wpos = ImGui::GetCursorScreenPos();
-                            const auto dpos = wpos + ImVec2( 0.5f, 0.5f );
-
-                            ImGui::InvisibleButton( "##histogram", ImVec2( w, Height + round( ty * 2.5 ) ) );
-                            const bool hover = ImGui::IsItemHovered();
-
-                            auto draw = ImGui::GetWindowDrawList();
-                            draw->AddRectFilled( wpos, wpos + ImVec2( w, Height ), 0x22FFFFFF );
-                            draw->AddRect( wpos, wpos + ImVec2( w, Height ), 0x88FFFFFF );
-
-                            if( m_frameSortData.logVal )
-                            {
-                                const auto hAdj = double( Height - 4 ) / log10( maxVal + 1 );
-                                for( int i=0; i<numBins; i++ )
-                                {
-                                    const auto val = bins[i];
-                                    if( val > 0 )
-                                    {
-                                        DrawLine( draw, dpos + ImVec2( 2+i, Height-3 ), dpos + ImVec2( 2+i, Height-3 - log10( val + 1 ) * hAdj ), 0xFF22DDDD );
-                                    }
-                                }
-                            }
-                            else
-                            {
-                                const auto hAdj = double( Height - 4 ) / maxVal;
+                                const auto hAdj = double( Height - 4 ) / drawMaxVal;
                                 for( int i=0; i<numBins; i++ )
                                 {
                                     const auto val = bins[i];
@@ -680,6 +975,7 @@ void View::DrawInfo()
                             }
                         }
                     }
+                }
                 }
 
                 ImGui::TreePop();

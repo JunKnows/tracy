@@ -1498,11 +1498,14 @@ void View::SelectThread( uint64_t thread )
 bool View::WasActive() const
 {
     return m_wasActive.load( std::memory_order_acquire ) ||
-        m_zoomAnim.active ||
-        m_notificationTime > 0 ||
-        !m_playback.pause ||
-        m_worker.IsConnected() ||
-        !m_worker.IsBackgroundDone();
+           m_zoomAnim.active ||
+           m_notificationTime > 0 ||
+        // Keep refreshing while statistics replays are actively advancing.
+           ( m_showInfo && m_frameSortData.playback.active && !m_frameSortData.playback.pause ) ||
+           ( m_findZone.show && m_findZone.playback.active && !m_findZone.playback.pause ) ||
+           !m_playback.pause ||
+           m_worker.IsConnected() ||
+           !m_worker.IsBackgroundDone();
 }
 
 void View::AddLlmAttachment( const nlohmann::json& json )
